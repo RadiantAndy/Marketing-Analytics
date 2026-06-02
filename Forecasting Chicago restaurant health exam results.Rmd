@@ -1,0 +1,750 @@
+Forecasting Assignment
+
+```{r}
+install.packages("tidyverse")
+install.packages("pROC")
+install.packages("lubridate")
+library(lubridate)
+library(pROC)
+library(tidyverse)
+```
+
+```{r}
+
+#Code copied from the class slides
+
+# Ready-to-use sample — prior inspection features already computed
+df <- readRDS("chicago_food_df.rds")
+# Q4 only: full raw data for monthly aggregation
+df_raw <- read_csv("food_inspections.csv", show_col_types = FALSE)
+# Train / test split (75 / 25)
+set.seed(123)
+train_idx <- sample(seq_len(nrow(df)), floor(0.75 * nrow(df)))
+train <- df[train_idx, ]
+test <- df[-train_idx, ]
+
+```
+
+I want to look at the data 
+```{r}
+head(df_raw)
+```
+```{r}
+head(df)
+```
+1. Fit a logistic regression predicting fail from Risk, Facility Type, and any other variables you find
+useful
+• Which variable has the strongest association with failing an inspection?
+• Compute and interpret the marginal effect of moving from Risk 1 to Risk 3
+
+```{r}
+
+cat("=== Data Overview ===\n")
+glimpse(train)
+cat("\nFail rate in train:", round(mean(train$fail), 3), "\n")
+cat("Fail rate by Risk:\n")
+train %>% group_by(risk) %>%
+  summarise(fail_rate = mean(fail), n = n()) %>% print()
+ 
+# ── 2. Prepare factors ───────────────────────────────────────
+# Risk: treat as factor so we get interpretable dummy coefficients
+# Reference levels: Risk 1 (lowest risk), Restaurant (most common)
+train <- train %>%
+  mutate(
+    risk_f          = factor(risk, levels = c(1, 2, 3)),
+    facility_type_f = fct_relevel(factor(facility_type), "Restaurant")
+  )
+ 
+test <- test %>%
+  mutate(
+    risk_f          = factor(risk, levels = c(1, 2, 3)),
+    facility_type_f = fct_relevel(factor(facility_type), "Restaurant")
+  )
+ 
+# ── 3. Fit logistic regression ────────────────────────────────
+# Predictors chosen:
+#   risk_f          – regulatory risk tier (key predictor of interest)
+#   facility_type_f – type of establishment
+#   prev_fail       – whether the facility failed its last inspection
+#   prev_violations – number of violations in prior inspection
+#   n_prev_inspect  – inspection history depth (proxy for facility age/track record)
+#   n_violations    – NOT included (it's measured at inspection time → data leakage)
+ 
+m_logit <- glm(
+  fail ~ risk_f + facility_type_f + prev_fail + prev_violations + n_prev_inspect,
+  data   = train,
+  family = binomial(link = "logit")
+)
+ 
+cat("\n\n===== Logistic Regression Summary =====\n")
+summary(m_logit)
+ 
+# ── 4. Odds ratios (easier to interpret than log-odds) ────────
+cat("\n===== Odds Ratios & 95% CIs =====\n")
+or_table <- cbind(
+  OR    = exp(coef(m_logit)),
+  exp(confint(m_logit))
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("term") %>%
+  rename(CI_lower = `2.5 %`, CI_upper = `97.5 %`) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+ 
+print(or_table)
+ 
+# ── 5. Strongest predictor ────────────────────────────────────
+cat("\n===== Strongest Predictor (by |z-value|) =====\n")
+tidy_logit <- broom::tidy(m_logit)
+tidy_logit %>%
+  filter(term != "(Intercept)") %>%
+  mutate(abs_z = abs(statistic)) %>%
+  arrange(desc(abs_z)) %>%
+  select(term, estimate, statistic, p.value, abs_z) %>%
+  print()
+ 
+# ── 6. Marginal effect: Risk 1 → Risk 3 ──────────────────────
+cat("\n===== Marginal Effect: Risk 1 → Risk 3 =====\n")
+ 
+# Average Marginal Effect (AME): compute predicted probability for each
+# observation at Risk 1, then at Risk 3, take the average difference
+ 
+# Clone train data, set everyone to Risk 1
+train_r1 <- train %>% mutate(risk_f = factor(1, levels = c(1, 2, 3)))
+# Clone train data, set everyone to Risk 3
+train_r3 <- train %>% mutate(risk_f = factor(3, levels = c(1, 2, 3)))
+ 
+p_risk1 <- predict(m_logit, newdata = train_r1, type = "response")
+p_risk3 <- predict(m_logit, newdata = train_r3, type = "response")
+ 
+AME <- mean(p_risk3 - p_risk1)
+ 
+cat(sprintf("Mean predicted P(fail | Risk 1): %.4f\n", mean(p_risk1)))
+cat(sprintf("Mean predicted P(fail | Risk 3): %.4f\n", mean(p_risk3)))
+cat(sprintf("Average Marginal Effect (Risk 1→3): +%.4f (+%.1f percentage points)\n",
+            AME, AME * 100))
+ 
+# Also show at a "typical" observation (means/modes)
+typical <- train %>%
+  summarise(
+    risk_f          = factor(1, levels = c(1,2,3)),
+    facility_type_f = factor("Restaurant", levels = levels(train$facility_type_f)),
+    prev_fail       = round(mean(prev_fail)),
+    prev_violations = round(mean(prev_violations)),
+    n_prev_inspect  = round(mean(n_prev_inspect))
+  )
+ 
+typical_r3 <- typical %>% mutate(risk_f = factor(3, levels = c(1,2,3)))
+ 
+p_typ_r1 <- predict(m_logit, newdata = typical,    type = "response")
+p_typ_r3 <- predict(m_logit, newdata = typical_r3, type = "response")
+ 
+cat(sprintf("\nAt a typical Restaurant with average prior history:\n"))
+cat(sprintf("  P(fail | Risk 1) = %.4f\n", p_typ_r1))
+cat(sprintf("  P(fail | Risk 3) = %.4f\n", p_typ_r3))
+cat(sprintf("  Marginal effect  = +%.4f (+%.1f pp)\n",
+            p_typ_r3 - p_typ_r1, (p_typ_r3 - p_typ_r1) * 100))
+ 
+# ── 7. Model performance on test set ─────────────────────────
+cat("\n===== Test Set Performance =====\n")
+ 
+test_probs <- predict(m_logit, newdata = test, type = "response")
+test_preds <- ifelse(test_probs > 0.5, 1, 0)
+ 
+confusion <- table(Predicted = test_preds, Actual = test$fail)
+cat("Confusion matrix:\n")
+print(confusion)
+ 
+accuracy  <- mean(test_preds == test$fail)
+precision <- confusion[2,2] / sum(confusion[2,])
+recall    <- confusion[2,2] / sum(confusion[,2])
+f1        <- 2 * precision * recall / (precision + recall)
+ 
+cat(sprintf("\nAccuracy:  %.4f\n", accuracy))
+cat(sprintf("Precision: %.4f\n", precision))
+cat(sprintf("Recall:    %.4f\n", recall))
+cat(sprintf("F1 Score:  %.4f\n", f1))
+ 
+# AUC-ROC
+if (requireNamespace("pROC", quietly = TRUE)) {
+  library(pROC)
+  roc_obj <- roc(test$fail, test_probs, quiet = TRUE)
+  cat(sprintf("AUC-ROC:   %.4f\n", auc(roc_obj)))
+} else {
+  cat("Install pROC for AUC: install.packages('pROC')\n")
+}
+
+
+
+```
+Analysis 
+
+Strongest Predictor: prev_violations (z = 8.67, p = 4.31e-18)
+
+By a massive margin, the number of violations in a facility's prior inspection is the dominant predictor. The odds ratio is 1.125, meaning each additional previous violation multiplies the odds of failing by 12.5%. A facility with 8 prior violations has roughly (1.125)^8 = 2.66× the odds of failing compared to one with zero. This is pretty intuitive, since past behaviour is the best predictor of future behaviour, and chronic violators don't suddenly change their behavior.
+
+Everything else is weak by comparison. Risk_f2 is significant (p = 0.033), but the t-statististic is smaller and risk_f3, facility_type, prev_fail, and n_prev_inspect are all non-significant.
+
+Moving from Risk 1 to Risk 3 is associated with a 5.8 percentage point decrease in the predicted probability of failing, holding all other variables constant. This makes complete sense, since lower risk factors should have lower odds of failing. 
+
+
+2. Fit a CART model with the same outcome
+• Draw the tree and describe the first split in plain English
+• Prune the tree, how many terminal nodes remain?
+
+```{r}
+library(rpart)        
+install.packages("rpart.plot")
+library(rpart.plot)     
+```
+
+
+```{r}
+# ── Prepare factors ──────────────────────────────────────────
+train <- train %>%
+  mutate(
+    risk_f          = factor(risk, levels = c(1, 2, 3)),
+    facility_type_f = fct_relevel(factor(facility_type), "Restaurant"),
+    fail            = factor(fail, levels = c(0, 1), labels = c("Pass", "Fail"))
+  )
+ 
+test <- test %>%
+  mutate(
+    risk_f          = factor(risk, levels = c(1, 2, 3)),
+    facility_type_f = fct_relevel(factor(facility_type), "Restaurant"),
+    fail            = factor(fail, levels = c(0, 1), labels = c("Pass", "Fail"))
+  )
+ 
+# ── 1. Fit full (unpruned) CART tree ─────────────────────────
+cart_full <- rpart(
+  fail ~ risk_f + facility_type_f + prev_fail + prev_violations + n_prev_inspect,
+  data    = train,
+  method  = "class",
+  control = rpart.control(minsplit = 20, minbucket = 7, cp = 0.001)
+)
+ 
+cat("===== Full Tree =====\n")
+printcp(cart_full)
+cat("Terminal nodes (full):", sum(cart_full$frame$var == "<leaf>"), "\n")
+ 
+# ── 2. Plot the full tree ─────────────────────────────────────
+rpart.plot(
+  cart_full,
+  type  = 4, extra = 104, under = TRUE, fallen.leaves = TRUE,
+  main  = "CART – Full Tree",
+  cex   = 0.7
+)
+ 
+# ── 3. Prune using the 1-SE rule ─────────────────────────────
+cp_table   <- as.data.frame(cart_full$cptable)
+min_xerror <- min(cp_table$xerror)
+threshold  <- min_xerror + cp_table$xstd[which.min(cp_table$xerror)]
+ 
+best_cp <- cp_table %>%
+  filter(xerror <= threshold) %>%
+  slice(1) %>%
+  pull(CP)
+ 
+cat(sprintf("\nSelected CP: %.6f\n", best_cp))
+ 
+cart_pruned <- prune(cart_full, cp = best_cp)
+ 
+n_leaves <- sum(cart_pruned$frame$var == "<leaf>")
+cat("Terminal nodes after pruning:", n_leaves, "\n")
+ 
+# ── 4. Plot the pruned tree ───────────────────────────────────
+rpart.plot(
+  cart_pruned,
+  type  = 4, extra = 104, under = TRUE, fallen.leaves = TRUE,
+  main  = paste0("CART – Pruned Tree (", n_leaves, " terminal nodes)"),
+  cex   = 0.8
+)
+ 
+# ── 5. Variable importance ────────────────────────────────────
+cat("\n===== Variable Importance =====\n")
+tibble(
+  variable   = names(cart_pruned$variable.importance),
+  importance = cart_pruned$variable.importance
+) %>% arrange(desc(importance)) %>% print()
+```
+
+In plain English, the first split of the tree asks whether the restaurant has had fewer than 4 violations. If it did have fewer than 3, it splits to the left, otherwise you continue the branches. The full tree is chaotic. 
+
+We prune down to a simplified, more interpretable 3 terminal node model afterwards. 
+
+---------------------------------------------------------------------------------
+3. 
+Evaluate both models on a 25% held-out test set
+• Report accuracy, F1, and AUC-ROC for each; which model would you deploy?
+
+```{r}
+# ── 1. Logistic regression predictions ───────────────────────
+# Refit logistic on train (with numeric fail, not factor)
+train_num <- train %>% mutate(fail_num = as.integer(fail == "Fail"))
+test_num  <- test  %>% mutate(fail_num = as.integer(fail == "Fail"))
+ 
+m_logit <- glm(
+  fail_num ~ risk_f + facility_type_f + prev_fail + prev_violations + n_prev_inspect,
+  data   = train_num,
+  family = binomial(link = "logit")
+)
+ 
+logit_probs <- predict(m_logit, newdata = test_num, type = "response")
+logit_preds <- ifelse(logit_probs >= 0.5, 1, 0)
+ 
+# ── 2. CART predictions ───────────────────────────────────────
+cart_probs <- predict(cart_pruned, newdata = test, type = "prob")[, "Fail"]
+cart_preds <- ifelse(cart_probs >= 0.5, 1, 0)
+ 
+actual <- test_num$fail_num
+ 
+# ── 3. Metrics function ───────────────────────────────────────
+get_metrics <- function(actual, preds, probs, model_name) {
+  cm        <- table(Predicted = preds, Actual = actual)
+  accuracy  <- mean(preds == actual)
+  tp        <- cm["1", "1"]
+  precision <- tp / sum(cm["1", ])
+  recall    <- tp / sum(cm[, "1"])
+  f1        <- 2 * precision * recall / (precision + recall)
+  auc       <- as.numeric(auc(roc(actual, probs, quiet = TRUE)))
+  
+  tibble(
+    Model     = model_name,
+    Accuracy  = round(accuracy, 4),
+    F1        = round(f1, 4),
+    AUC_ROC   = round(auc, 4)
+  )
+}
+ 
+# ── 4. Results table ─────────────────────────────────────────
+results <- bind_rows(
+  get_metrics(actual, logit_preds, logit_probs, "Logistic Regression"),
+  get_metrics(actual, cart_preds,  cart_probs,  "CART (Pruned)")
+)
+ 
+cat("===== Model Comparison =====\n")
+print(results)
+ 
+# ── 5. ROC curves ─────────────────────────────────────────────
+roc_logit <- roc(actual, logit_probs, quiet = TRUE)
+roc_cart  <- roc(actual, cart_probs,  quiet = TRUE)
+ 
+plot(roc_logit, col = "steelblue", lwd = 2,
+     main = "ROC Curves: Logistic vs CART")
+lines(roc_cart, col = "tomato", lwd = 2)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic (AUC = ", round(auc(roc_logit), 3), ")"),
+         paste0("CART     (AUC = ", round(auc(roc_cart),  3), ")")
+       ),
+       col = c("steelblue", "tomato"), lwd = 2)
+```
+Answer : Both models have an AUC_ROC that are barely above random (0.5). They also have essentially the same accuracy at 0.72 and the F1 score corroborates this. We must also remember that the data has a strong class imbalance, with Failures being much rarer than successes. The Accuracy thus carries less weight than AUC and F-1 score here.
+
+The logisitic regression could be prioritized, because it is more interpretable and gives more actionable recommendations to a business staekholder, be it an inspector ; Example : check all restaurants with probability over threshold = 40% first. Or a restaurant owner : example : your restaurant has a 40% chance of failing change variables x, y, and z 
+
+The decision tree has more variability intrinsically, a different test set could complete change the nodes and make you start from scratch. 
+
+You could also be a perfectionist and decide that none are good enough and then move on to Gradient Boosting or Random Forest in the search for a better model . 
+-----------------------------------------------------------------
+
+4. Aggregate the full dataset to monthly pass rates (proportion of inspections that passed each month)
+and fit a dynamic linear model predicting next month’s pass rate from its own lags
+
+```{r}
+# ── 1. Aggregate to monthly pass rate ────────────────────────
+monthly <- df_raw %>%
+  mutate(
+    date       = mdy(`Inspection Date`),   # parse "MM/DD/YYYY" format
+    pass       = as.integer(Results == "Pass"),
+    year_month = floor_date(date, "month")
+  ) %>%
+  filter(!is.na(pass), !is.na(date)) %>%
+  group_by(year_month) %>%
+  summarise(
+    n_inspections = n(),
+    n_pass        = sum(pass),
+    pass_rate     = n_pass / n_inspections,
+    .groups = "drop"
+  ) %>%
+  arrange(year_month) %>%
+  # Drop months with very few inspections (unreliable rates)
+  filter(n_inspections >= 10)
+ 
+cat("===== Monthly Pass Rate (first 12 rows) =====\n")
+print(head(monthly, 12))
+cat(sprintf("\nTotal months: %d\n", nrow(monthly)))
+cat(sprintf("Date range: %s to %s\n",
+            min(monthly$year_month), max(monthly$year_month)))
+ 
+# ── 2. Plot the time series ───────────────────────────────────
+ggplot(monthly, aes(x = year_month, y = pass_rate)) +
+  geom_line(colour = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, colour = "tomato",
+              linetype = "dashed") +
+  labs(title = "Monthly Pass Rate – Chicago Food Inspections",
+       x = NULL, y = "Pass Rate") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme_minimal()
+ 
+# ── 3. Build lagged features ──────────────────────────────────
+# Dynamic linear model: pass_rate(t) ~ pass_rate(t-1) + pass_rate(t-2)
+# Using OLS with lagged predictors — the "dynamic linear model" framing
+# for a time series regression
+ 
+monthly_lags <- monthly %>%
+  mutate(
+    lag1 = lag(pass_rate, 1),
+    lag2 = lag(pass_rate, 2)
+  ) %>%
+  drop_na()   # remove first 2 rows which have no lag values
+ 
+cat("\n===== Lagged Dataset (first 6 rows) =====\n")
+print(head(monthly_lags %>% select(year_month, pass_rate, lag1, lag2)))
+ 
+# ── 4. Train / test split (last 12 months as test) ───────────
+n         <- nrow(monthly_lags)
+test_start <- n - 11   # last 12 months
+ 
+train_ts <- monthly_lags[1:(test_start - 1), ]
+test_ts  <- monthly_lags[test_start:n, ]
+ 
+cat(sprintf("\nTrain months: %d | Test months: %d\n",
+            nrow(train_ts), nrow(test_ts)))
+ 
+# ── 5. Fit DLM (AR(2) via OLS) ───────────────────────────────
+dlm <- lm(pass_rate ~ lag1 + lag2, data = train_ts)
+ 
+cat("\n===== Dynamic Linear Model Summary =====\n")
+summary(dlm)
+ 
+# ── 6. Forecast on test set ───────────────────────────────────
+test_ts <- test_ts %>%
+  mutate(
+    predicted  = predict(dlm, newdata = test_ts),
+    residual   = pass_rate - predicted
+  )
+ 
+rmse <- sqrt(mean(test_ts$residual^2))
+mae  <- mean(abs(test_ts$residual))
+ 
+cat(sprintf("\nTest RMSE: %.4f\n", rmse))
+cat(sprintf("Test MAE:  %.4f\n", mae))
+ 
+# ── 7. Plot actual vs predicted ───────────────────────────────
+bind_rows(
+  train_ts %>% mutate(series = "Train", predicted = fitted(dlm)),
+  test_ts   %>% mutate(series = "Test")
+) %>%
+  ggplot(aes(x = year_month)) +
+  geom_line(aes(y = pass_rate,  colour = "Actual"),    linewidth = 0.8) +
+  geom_line(aes(y = predicted,  colour = "Predicted"), linewidth = 0.8,
+            linetype = "dashed") +
+  geom_vline(xintercept = as.numeric(test_ts$year_month[1]),
+             linetype = "dotted", colour = "grey40") +
+  annotate("text",
+           x     = test_ts$year_month[1],
+           y     = min(monthly_lags$pass_rate, na.rm = TRUE),
+           label = "Test period →",
+           hjust = -0.1, size = 3, colour = "grey40") +
+  scale_colour_manual(values = c("Actual" = "steelblue",
+                                 "Predicted" = "tomato")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "DLM: Actual vs Predicted Monthly Pass Rate",
+       x = NULL, y = "Pass Rate", colour = NULL) +
+  theme_minimal()
+ 
+# ── 8. Check autocorrelation of residuals ─────────────────────
+cat("\n===== Residual Autocorrelation =====\n")
+acf(resid(dlm), main = "ACF of DLM Residuals")
+cat("If bars stay within blue dashed lines → residuals are white noise (good)\n")
+```
+Analysis : 
+lag1 is the only predictor that matters. A coefficient of 0.951 means next month's pass rate is almost entirely explained by this month's pass rate — specifically, 95.1 cents of every 1 percentage point carries forward. The series has very strong momentum. The intercept of 0.034 acts as a small mean-reverting pull — when pass rates are low, this nudges predictions slightly upward toward the long-run mean.
+lag2 is completely redundant (p = 0.815). Once you know this month's pass rate, knowing last month's adds nothing. 
+
+
+-----------------------------------------------------------
+DEFEND YOUR CHOICES 
+-----------------------------------------------------------------------------------------------------------
+
+1. Threshold decision. At the default 0.5 cut-off, what is your logistic model’s precision and recall on
+the test set? If a failed inspection triggers a €500 remediation cost and a missed failure costs the city
+€2,000 in health risk, what threshold maximises expected value? Show the calculation.
+
+```{r}
+#We already know that the model will prioritize minimizing false negatives more than false positives, since the cost of a false negative is 4 x the cost of a false positive. Thus, the threshold should be below 50% 
+
+
+preds_05 <- ifelse(logit_probs >= 0.5, 1, 0)
+cm_05    <- table(Predicted = preds_05, Actual = actual)
+cat("===== Confusion Matrix at 0.5 =====\n")
+print(cm_05)
+ 
+tp_05 <- cm_05["1", "1"]
+fp_05 <- cm_05["1", "0"]
+fn_05 <- cm_05["0", "1"]
+tn_05 <- cm_05["0", "0"]
+ 
+precision_05 <- tp_05 / (tp_05 + fp_05)
+recall_05    <- tp_05 / (tp_05 + fn_05)
+cat(sprintf("\nPrecision at 0.5: %.4f\n", precision_05))
+cat(sprintf("Recall    at 0.5: %.4f\n", recall_05))
+ 
+# ── 2. Cost parameters ────────────────────────────────────────
+cost_fp <- 500    # false positive: flag a passer → unnecessary remediation
+cost_fn <- 2000   # false negative: miss a failure → health risk cost
+ 
+# ── 3. Sweep thresholds and compute expected cost ─────────────
+thresholds <- seq(0.01, 0.99, by = 0.01)
+ 
+results <- map_dfr(thresholds, function(t) {
+  preds <- ifelse(logit_probs >= t, 1, 0)
+  cm    <- table(factor(preds, levels = c(0,1)),
+                 factor(actual, levels = c(0,1)))
+  
+  tp <- cm["1", "1"]
+  fp <- cm["1", "0"]
+  fn <- cm["0", "1"]
+  tn <- cm["0", "0"]
+  
+  total_cost    <- fp * cost_fp + fn * cost_fn
+  precision_t   <- ifelse((tp + fp) > 0, tp / (tp + fp), NA)
+  recall_t      <- ifelse((tp + fn) > 0, tp / (tp + fn), NA)
+  
+  tibble(
+    threshold  = t,
+    tp = tp, fp = fp, fn = fn, tn = tn,
+    total_cost = total_cost,
+    precision  = precision_t,
+    recall     = recall_t
+  )
+})
+ 
+# ── 4. Find optimal threshold ─────────────────────────────────
+optimal <- results %>% filter(total_cost == min(total_cost))
+ 
+cat("\n===== Optimal Threshold =====\n")
+print(optimal %>% select(threshold, tp, fp, fn, tn, total_cost, precision, recall))
+ 
+# ── 5. Show calculation at optimal threshold ──────────────────
+cat("\n===== Cost Calculation at Optimal Threshold =====\n")
+cat(sprintf("Threshold:          %.2f\n",   optimal$threshold))
+cat(sprintf("True  positives:    %d  (correctly flagged failures)\n", optimal$tp))
+cat(sprintf("False positives:    %d  (unnecessary remediations @ €%d each)\n",
+            optimal$fp, cost_fp))
+cat(sprintf("False negatives:    %d  (missed failures @ €%d each)\n",
+            optimal$fn, cost_fn))
+cat(sprintf("True  negatives:    %d\n", optimal$tn))
+cat(sprintf("\nFP cost: %d × €%d = €%d\n", optimal$fp, cost_fp, optimal$fp * cost_fp))
+cat(sprintf("FN cost: %d × €%d = €%d\n", optimal$fn, cost_fn, optimal$fn * cost_fn))
+cat(sprintf("Total cost:         €%d\n", optimal$total_cost))
+cat(sprintf("vs. cost at 0.5:    €%d\n", results$total_cost[results$threshold == 0.50]))
+cat(sprintf("Saving:             €%d\n",
+            results$total_cost[results$threshold == 0.50] - optimal$total_cost))
+ 
+# ── 6. Plot cost curve ────────────────────────────────────────
+ggplot(results, aes(x = threshold, y = total_cost)) +
+  geom_line(colour = "steelblue", linewidth = 0.9) +
+  geom_vline(xintercept = optimal$threshold,
+             colour = "tomato", linetype = "dashed") +
+  geom_vline(xintercept = 0.5,
+             colour = "grey50", linetype = "dotted") +
+  annotate("text", x = optimal$threshold + 0.03,
+           y = max(results$total_cost) * 0.95,
+           label = paste0("Optimal\nthreshold = ", optimal$threshold),
+           colour = "tomato", size = 3.5, hjust = 0) +
+  annotate("text", x = 0.53,
+           y = max(results$total_cost) * 0.85,
+           label = "Default 0.5",
+           colour = "grey50", size = 3.5, hjust = 0) +
+  labs(title = "Expected Cost by Classification Threshold",
+       x = "Threshold", y = "Total Cost (€)") +
+  scale_y_continuous(labels = scales::comma_format(prefix = "€")) +
+  theme_minimal()
+ 
+# ── 7. Precision-recall tradeoff across thresholds ───────────
+results %>%
+  filter(!is.na(precision), !is.na(recall)) %>%
+  pivot_longer(c(precision, recall), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = threshold, y = value, colour = metric)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = optimal$threshold,
+             colour = "tomato", linetype = "dashed") +
+  scale_colour_manual(values = c("precision" = "steelblue",
+                                 "recall"    = "darkgreen")) +
+  labs(title = "Precision & Recall vs Threshold",
+       x = "Threshold", y = NULL, colour = NULL) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme_minimal()
+```
+
+The expected cost by threshold chart shows that the optimal threshold which minimizes cost is at around 19%
+This was done by simply plotting out the sumproduct of expected number of FPs and FNs multiplied by the costs assigned by the question for different values of threshold
+
+2. 
+Tree audit. Pick the leaf node with the highest predicted failure probability. State the full path of
+splits that leads to it. Does the combination of features make sense from a food-safety perspective?
+
+
+The highest failure probability leaf: prev_violations ≥ 10 (55% fail probability)
+
+The full path of splits leading to it:
+
+Split 1 — Root node: prev_violations < 4?
+
+→ No (prev_violations ≥ 4) — facility goes right, entering the 46% of inspections with a moderate-to-bad violation history
+
+Split 2 — Internal node: prev_violations < 10?
+
+→ No (prev_violations ≥ 10) — facility goes right again, into the terminal failure node
+So the complete rule is: "Any facility that accumulated 10 or more violations at its last inspection is predicted to fail." This node covers 7% of all inspections and predicts a 55% failure probability — the only node in the entire tree where Fail is the majority class.
+
+This makes absolute sense. It may seem unnatural that the tree does not imply any of the other factors (risk, facility type, number of inspections, etc.), but it just shows that number of failures dominates those features. It doesn't feel right that a Risk 1 restaurant with a clean history is still safer than a Risk 3 with a terrible history, but Risks seemed to be assigned BASED on risk history, so a restaurant with terrible record would not be risk 3 in the first place. 
+
+And again, this makes sense. Not only that, but the fact that restaurants with more than 10 failures ONLY have a 55% fail rate means the algo is probably not aggressive enough, and ironically not usable because it's too conservative. 
+
+Fool me once, shame on you, Fool me 10 times and I fully deserve to die from food posioning. 
+
+-------------------------------------------------------------------------------------------------------------------
+3. Model disagreement. Does your logistic regression agree with your CART on the top-2 predictors of
+failure? If they disagree, which do you trust more for this decision and why?
+
+What each model says the top-2 predictors are:
+Logistic Regression (by |z|)
+1prev_violations (z = 8.67)
+2risk_f2 (z = 2.13)
+
+CART Variable Importance
+prev_violations (59.8)
+prev_fail (19.3)
+
+They agree on #1, meaning that prev_violations dominates both models by a wide margin. 
+They disagree on #2: logistic picks risk_f (the regulatory risk tier) while CART picks prev_fail (whether the facility failed its last inspection).
+
+I believe that the prev_fail may be an artefact of the model itself and not of the actual data. It is the result of aggressive pruning that took out risk_f in order to reach 3 terminal nodes. The risk_f is a regulatory and domain-specific variable that is easier to defend to business stakeholders and is given a fair evaluation in the logistic regression, which proved its statistical signifiance. It was probably in the lower nodes of the CART, but pruned out because prev_violations had so much dominance 
+
+
+--------------------------------------------------------------------------------------------------------------
+
+4. AI-assisted, human-verified. Use an LLM to draft a one-paragraph summary of your logistic
+regression for a fictional city health commissioner. Edit it so every claim is traceable to a specific
+coefficient or metric in your output. Mark each edit.
+
+ORIGINAL AI OUTPUT (CLAUDE CODE)
+To: City Health Commissioner
+Re: Predictive model for food inspection failures
+We fitted a logistic regression model to predict whether a Chicago food establishment will fail its next routine inspection, using violation history, risk classification, and host responsiveness as predictors. The single strongest signal is a facility's prior violation count — each additional violation recorded at the last inspection multiplies the odds of failing the next one by 1.125 (coefficient = 0.118, z = 8.67, p < 2×10⁻¹⁶), meaning a facility with 10 prior violations carries roughly 2.7 times the odds of failure compared to a clean-record establishment. Risk tier also predicts outcomes in the expected direction: Risk 1 facilities — our highest-risk category — have a 32.2% baseline failure rate, and Risk 2 establishments show significantly lower odds of failure (OR = 0.781, p = 0.033), though the Risk 3 coefficient does not reach statistical significance (p = 0.378). On a held-out test set of 1,250 inspections, the model achieves 72% accuracy and an AUC-ROC of 0.627, but at the default decision threshold it correctly identifies only 14% of actual failures — meaning the large majority of problematic establishments are currently missed before deployment. We recommend lowering the classification threshold and pairing the model with a cost-benefit analysis (a missed failure costs the city an estimated 4× more than an unnecessary follow-up visit) before using it to prioritise inspection scheduling.
+
+
+EDITED BY ME 
+
+To: City Health Commissioner
+Re: Predictive model for food inspection failures
+
+We fitted a logistic regression model to predict whether a given Chicago food establishment will fail its next routine inspection, using violation history, risk classification, and number of previous inspections as predictors. Concretely, the factors were labeled risk_f, n_violations and n_prev_inspect in our database. The single strongest signal is a facility's prior violation count. Each additional violation recorded at the last inspection multiplies the odds of failing the next one by 1.125 (coefficient = 0.118, z = 8.67, p < 2×10⁻¹⁶), meaning a facility with 10 prior violations carries roughly 2.7 times the odds of failure compared to a clean-record establishment. Risk tier also predicts outcomes in the expected direction: Risk 1 facilities (our highest-risk category) have a 32.2% baseline failure rate, and Risk 2 establishments show significantly lower odds of failure (OR = 0.781, p = 0.033), though the Risk 3 coefficient does not reach statistical significance (p = 0.378). 
+
+On a held-out test set of 1,250 inspections, the model achieves 72% accuracy and an AUC-ROC of 0.627, but at the default decision threshold it correctly identifies only 14% of actual failures, meaning the large majority of problematic establishments are currently missed before deployment. We recommend lowering the classification threshold and pairing the model with a cost-benefit analysis (a missed failure costs the city an estimated 4× more than an unnecessary follow-up visit) before using it to prioritise inspection scheduling.
+
+-------------------------------------------------------------------------------------------------------------------5. Counterfactual. A new fast-food franchise (Facility Type = "Restaurant", Risk = 1) applies for
+a permit. Using your fitted model, what is its predicted probability of failing its first routine inspection?
+What single feature change would reduce that probability the most?
+
+```{r}
+# ── 1. Define the new fast food joints profile ───────────────────────
+# First-time applicant: no inspection history at all
+new_facility <- tibble(
+  risk_f          = factor(1, levels = c(1, 2, 3)),
+  facility_type_f = factor("Restaurant",
+                            levels = levels(train$facility_type_f)),
+  prev_fail       = 0,      # no prior inspection
+  prev_violations = 0,      # no prior violations
+  n_prev_inspect  = 0       # never been inspected
+)
+ 
+base_prob <- predict(m_logit, newdata = new_facility, type = "response")
+cat(sprintf("Base predicted P(fail) for new franchise: %.4f (%.1f%%)\n",
+            base_prob, base_prob * 100))
+ 
+# ── 2. Sweep each feature and find the biggest reduction ─────
+# For continuous variables: try realistic alternative values
+# For categorical: try other levels
+ 
+counterfactuals <- bind_rows(
+ 
+  # prev_violations: new franchises start at 0 — already there,
+  # but show what happens as violations accumulate
+  tibble(feature = "prev_violations = 2 (after first inspection)",
+         new_facility %>% mutate(prev_violations = 2)),
+  tibble(feature = "prev_violations = 5",
+         new_facility %>% mutate(prev_violations = 5)),
+  tibble(feature = "prev_violations = 10",
+         new_facility %>% mutate(prev_violations = 10)),
+ 
+  # risk tier: what if reclassified to Risk 2 or 3?
+  tibble(feature = "risk_f = 2 (medium risk)",
+         new_facility %>% mutate(risk_f = factor(2, levels = c(1,2,3)))),
+  tibble(feature = "risk_f = 3 (lowest risk)",
+         new_facility %>% mutate(risk_f = factor(3, levels = c(1,2,3)))),
+ 
+  # facility type
+  tibble(feature = "facility_type = Grocery/Market",
+         new_facility %>% mutate(
+           facility_type_f = factor("Grocery/Market",
+                                    levels = levels(train$facility_type_f)))),
+  tibble(feature = "facility_type = School/Daycare",
+         new_facility %>% mutate(
+           facility_type_f = factor("School/Daycare",
+                                    levels = levels(train$facility_type_f)))),
+ 
+  # n_prev_inspect: show effect of inspection history depth
+  tibble(feature = "n_prev_inspect = 5 (established)",
+         new_facility %>% mutate(n_prev_inspect = 5)),
+  tibble(feature = "n_prev_inspect = 10 (long history)",
+         new_facility %>% mutate(n_prev_inspect = 10))
+)
+ 
+feature_labels <- counterfactuals$feature
+pred_data      <- counterfactuals %>% select(-feature)
+ 
+counterfactuals$pred_prob <- predict(m_logit,
+                                     newdata = pred_data,
+                                     type    = "response")
+ 
+counterfactuals <- counterfactuals %>%
+  mutate(
+    change_pp  = (pred_prob - base_prob) * 100,
+    direction  = if_else(change_pp < 0, "reduction", "increase")
+  ) %>%
+  arrange(change_pp)
+ 
+cat("\n===== Counterfactual Analysis =====\n")
+cat(sprintf("Baseline (new franchise, no history): %.4f (%.1f%%)\n\n",
+            base_prob, base_prob * 100))
+ 
+counterfactuals %>%
+  select(feature, pred_prob, change_pp) %>%
+  mutate(
+    pred_prob = round(pred_prob, 4),
+    change_pp = round(change_pp, 2)
+  ) %>%
+  print(n = 20)
+ 
+# ── 3. Biggest single reduction ──────────────────────────────
+best <- counterfactuals %>%
+  filter(direction == "reduction") %>%
+  slice(1)
+ 
+cat(sprintf("\nBiggest single reduction:\n"))
+cat(sprintf("  Feature change: %s\n",  best$feature))
+cat(sprintf("  New P(fail):    %.4f (%.1f%%)\n", best$pred_prob, best$pred_prob*100))
+cat(sprintf("  Reduction:      %.2f percentage points\n", abs(best$change_pp)))
+```
+
+
+There is a 22.1% that the place will fail its first inspection. Prior to the inspection, there is nothing to be done. All the other factors cannot be changed, since it is the first inspection. You cannot have negative previous inspections, you are already at the minimum (0) for the factors previous inspections and previous violations. Furthermore, you cannot suddenly change your facility type to grocery market, where the risk would be lower. The only variable that can be changed is the risk_f, which needs to move from 1 to 3 in order to from a 22% chance of failure to 17.5%
+
+
+
+
+
+
