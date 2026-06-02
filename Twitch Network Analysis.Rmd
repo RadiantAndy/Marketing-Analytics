@@ -1,0 +1,356 @@
+A gaming peripheral brand wants to partner with Twitch streamers for a product launch. Your task: use the English-language Twitch mutual-follow network to identify the most strategically positioned streamers.
+
+
+```{r}
+install.packages("tidyverse")
+install.packages("tidygraph")
+install.packages("ggraph")
+install.packages("igraph")
+install.packages("tidytext")
+library(tidytext)
+
+library(tidyverse)
+library(tidygraph)
+library(ggraph)
+library(igraph)
+```
+
+
+Question 1. Visualize the network and describe its structure - how many nodes, edges, and connected components?
+Plot the degree distribution. Does it follow a power law?
+```{r cars}
+#load data and specify column types
+edges <- read_csv("twitch_edges.csv", col_types = cols(from = col_double(), to = col_double()))
+nodes <- read_csv("twitch_nodes.csv", col_types = cols(
+  id = col_double(),
+  days = col_double(),
+  views = col_double(),
+  new_id = col_double(),
+  mature = col_logical(),
+  partner = col_logical()
+))
+```
+
+
+```{r pressure, echo=FALSE}
+
+# Put new_id as the first column so igraph uses it as the vertex identifier
+nodes_reordered <- nodes |> select(new_id, everything())
+
+# Build graph
+g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = nodes_reordered) |>
+  tidygraph::as_tbl_graph()
+
+```
+
+```{r}
+# build a basic structure
+cat("Nodes:", igraph::vcount(g), "\n")
+cat("Edges:", igraph::ecount(g), "\n")
+cat("Connected components:", igraph::components(g)$no, "\n")
+cat("Largest component size:", max(igraph::components(g)$csize), "\n")
+```
+
+```{r}
+# Filter to degree >= 10
+# Have to filter because there are so many nodes to visualize
+g_core <- g |>
+  tidygraph::activate(nodes) |>
+  mutate(degree = centrality_degree()) |>
+  filter(degree >= 10)
+
+ggraph(g_core, layout = "fr") +
+  geom_edge_link(alpha = 0.1, color = "grey60") +
+  geom_node_point(aes(size = degree), color = "steelblue", alpha = 0.7) +
+  scale_size_continuous(range = c(0.5, 4)) +
+  theme_graph() +
+  labs(title = "Twitch Core Network (degree ≥ 10)")
+```
+Question 2. Compute degree, betweenness, and eigenvector centrality. List the top-5 streamers by each metric. Do
+the three rankings agree on the same names
+
+```{r}
+# Filter to core first (speeds up computation significantly)
+g_core <- g |>
+  tidygraph::activate(nodes) |>
+  mutate(degree = centrality_degree()) |>
+  filter(degree >= 10)
+
+# Compute all three centrality metrics
+centrality_df <- g_core |>
+  tidygraph::activate(nodes) |>
+  mutate(
+    degree      = centrality_degree(),
+    betweenness = centrality_betweenness(normalized = TRUE),
+    eigen       = centrality_eigen()
+  ) |>
+  as_tibble()
+
+# Top 5 by degree
+centrality_df |>
+  select(name, degree, betweenness, eigen, partner) |>
+  arrange(desc(degree)) |>
+  head(5) |>
+  knitr::kable(caption = "Top 5 by Degree")
+
+# Top 5 by betweenness
+centrality_df |>
+  select(name, degree, betweenness, eigen, partner) |>
+  arrange(desc(betweenness)) |>
+  head(5) |>
+  knitr::kable(caption = "Top 5 by Betweenness")
+
+# Top 5 by eigenvector
+centrality_df |>
+  select(name, degree, betweenness, eigen, partner) |>
+  arrange(desc(eigen)) |>
+  head(5) |>
+  knitr::kable(caption = "Top 5 by Eigenvector")
+```
+```{r}
+colnames(centrality_df)
+```
+
+3. Join centrality scores with node attributes. Are official Twitch partners (is_partner) more central
+than non-partners? Does views correlate more strongly with degree or eigenvector centrality? Does
+views_per_day (audience efficiency) correlate differently than raw views?
+```{r}
+# Add views_per_day to centrality_df
+centrality_df <- centrality_df |>
+  mutate(views_per_day = views / days)
+
+# --- Partner vs Non-Partner ---
+centrality_df |>
+  group_by(partner) |>
+  summarise(
+    mean_degree  = mean(degree),
+    median_degree = median(degree),
+    mean_eigen   = mean(eigen),
+    median_eigen = median(eigen),
+    n = n()
+  ) |>
+  knitr::kable(caption = "Partner vs Non-Partner Centrality")
+
+# --- Correlations: views vs centrality ---
+centrality_df |>
+  summarise(
+    views_x_degree     = cor(views, degree),
+    views_x_eigen      = cor(views, eigen),
+    vpd_x_degree       = cor(views_per_day, degree),
+    vpd_x_eigen        = cor(views_per_day, eigen)
+  ) |>
+  knitr::kable(caption = "Correlations with Centrality")
+
+# --- Visualise: views vs degree ---
+ggplot(centrality_df, aes(x = degree, y = views, color = partner)) +
+  geom_point(alpha = 0.4, size = 1) +
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(
+    title = "Views vs Degree Centrality",
+    x = "Degree (log)", y = "Views (log)",
+    color = "Partner"
+  ) +
+  theme_minimal()
+
+#the graph shows clear distinct clusters that confirm that partners are 2x more central and have much larger audiences
+```
+4. Detect communities. How many communities form? Compare the two largest on median views,
+views_per_day, and days - do they represent distinct streamer profiles (e.g., established high-volume
+vs. newer fast-growing)?
+
+```{r}
+install.packages("igraph")
+library(igraph)
+
+# Community detection using walktrap
+g_core_undirected <- igraph::as.undirected(g_core |> igraph::as.igraph(), mode = "collapse")
+
+g_communities <- tidygraph::as_tbl_graph(g_core_undirected) |>
+  tidygraph::activate(nodes) |>
+  mutate(
+    community = as.factor(group_walktrap()),
+    views_per_day = views / days
+  )
+
+# How many communities?
+community_df <- g_communities |>
+  tidygraph::activate(nodes) |>
+  as_tibble()
+
+cat("Number of communities:", n_distinct(community_df$community), "\n")
+
+# Compare top 2 communities
+community_df |>
+  group_by(community) |>
+  summarise(
+    n              = n(),
+    median_views   = median(views),
+    median_vpd     = median(views_per_day),
+    median_days    = median(days),
+    partner_pct    = mean(partner) * 100,
+    mature_pct     = mean(mature) * 100
+  ) |>
+  arrange(desc(n)) |>
+  head(2) |>
+  knitr::kable(caption = "Top 2 Communities Compared")
+
+# Visualise communities
+ggraph(g_communities, layout = "fr") +
+  geom_edge_link(alpha = 0.05, color = "grey60") +
+  geom_node_point(aes(color = community, size = degree), alpha = 0.7) +
+  scale_size_continuous(range = c(0.5, 4)) +
+  theme_graph() +
+  labs(title = "Twitch Core Network — Communities")
+```
+
+5. Build a composite influencer score 
+views_per_day). Using views_per_day instead of raw views corrects for channel age - a streamer with
+3× the views but 10× the tenure is less efficient. Apply a brand-safety filter removing mature-content
+streamers (is_mature == TRUE) before scoring. Name your top 3 targets, justify your weights, and
+report whether filtering changed the ranking substantially.
+
+```{r}
+#Composite score is 40% normalised degree + 30% #eigenvector + 30% normalised
+
+
+# Brand-safe filter (remove mature content streamers)
+g_safe <- g_communities |>
+  tidygraph::activate(nodes) |>
+  filter(mature == FALSE)
+
+# Build composite score
+composite_df <- g_safe |>
+  tidygraph::activate(nodes) |>
+  mutate(
+    degree    = centrality_degree(),
+    eigen     = centrality_eigen(),
+    views_per_day = views / days,
+    
+    # Normalise each metric to 0-1
+    norm_degree = (degree - min(degree)) / (max(degree) - min(degree)),
+    norm_eigen  = (eigen  - min(eigen))  / (max(eigen)  - min(eigen)),
+    norm_vpd    = (views_per_day - min(views_per_day)) / (max(views_per_day) - min(views_per_day)),
+    
+    # Composite: 40% degree, 30% eigen, 30% views_per_day
+    composite = 0.4 * norm_degree + 0.3 * norm_eigen + 0.3 * norm_vpd
+  ) |>
+  as_tibble()
+
+# Top 3 targets
+composite_df |>
+  select(name, degree, eigen, views_per_day, views, days, partner, composite) |>
+  arrange(desc(composite)) |>
+  head(3) |>
+  knitr::kable(caption = "Top 3 Brand-Safe Influencer Targets")
+
+# Did filtering change the ranking? Compare with unfiltered
+composite_unfiltered <- g_communities |>
+  tidygraph::activate(nodes) |>
+  mutate(
+    degree    = centrality_degree(),
+    eigen     = centrality_eigen(),
+    views_per_day = views / days,
+    norm_degree = (degree - min(degree)) / (max(degree) - min(degree)),
+    norm_eigen  = (eigen  - min(eigen))  / (max(eigen)  - min(eigen)),
+    norm_vpd    = (views_per_day - min(views_per_day)) / (max(views_per_day) - min(views_per_day)),
+    composite = 0.4 * norm_degree + 0.3 * norm_eigen + 0.3 * norm_vpd
+  ) |>
+  as_tibble()
+
+cat("Top 3 unfiltered:\n")
+composite_unfiltered |> arrange(desc(composite)) |> slice_head(n = 3) |> pull(name) |> print()
+
+cat("Top 3 brand-safe:\n")
+composite_df |> arrange(desc(composite)) |> slice_head(n = 3) |> pull(name) |> print()
+
+#community 4949 was filtered out by the mature filter
+```
+6. Geographic network. A retail chain stores adjacency data as a column listing nearby store IDs
+within 10 km. In code or pseudocode: (a) convert to a tbl_graph, (b) compute degree and betweenness
+centrality, (c) test whether higher-degree stores generate higher average daily sales. Interpret the
+direction of the correlation.
+
+```{r}
+# (a) Convert to tbl_graph
+# Assume stores dataframe has columns: store_id, avg_daily_sales, nearby_ids
+# where nearby_ids is a comma-separated string of store_ids within 10km
+
+store_edges <- stores |>
+  select(Store, nearby_stores) |>
+  mutate(nearby_stores = as.character(nearby_stores)) |>  # force to character first
+  tidyr::separate_rows(nearby_stores, sep = ",") |>
+  mutate(nearby_stores = as.integer(str_trim(nearby_stores))) |>  # then convert to integer
+  rename(from = Store, to = nearby_stores) |>
+  filter(!is.na(to))
+
+g_stores <- tidygraph::tbl_graph(
+  nodes = stores,
+  edges = store_edges,
+  directed = FALSE,
+  node_key = "Store"  # match your actual ID column
+)
+
+g_stores <- g_stores |>
+  tidygraph::activate(nodes) |>
+  mutate(
+    degree      = centrality_degree(),
+    betweenness = centrality_betweenness(normalized = TRUE)
+  )
+
+store_metrics <- g_stores |>
+  tidygraph::activate(nodes) |>
+  as_tibble()
+
+# Check what columns you have
+colnames(store_metrics)
+```
+
+7.GraphRAG-lite. Using Data/Shared/reviews.rds, build a term co-occurrence knowledge graph
+from a sample of at least 1,500 polarised reviews (stars 􀀀 2 or 􀀀 4). Tokenize with tidytext, remove
+stop words, filter to terms appearing in at least 15 reviews, and draw edges between terms that co-occur
+in the same review at least 5 times. Detect communities with group_walktrap(). (a) How many
+communities form, and how many nodes does the largest contain? (b) List the top-6 terms by weighted
+degree for the two largest communities. (c) Name each community based on its terms. (d) Which
+community would you prioritise for a seeding campaign targeting dissatisfied customers, and why?
+
+```{r}
+
+# Load reviews
+reviews <- read_csv("review.csv")
+
+# Sample at least 1500 polarised reviews (stars <= 2 or >= 4)
+reviews_polarised <- reviews |>
+  filter(stars <= 2 | stars >= 4) |>
+  slice_sample(n = 1500)
+
+# Tokenize and remove stop words
+tokens <- reviews_polarised |>
+  select(review_id, text) |>
+  tidytext::unnest_tokens(word, text) |>
+  anti_join(tidytext::stop_words, by = "word") |>
+  filter(!str_detect(word, "^[0-9]+$"))  # remove pure numbers
+
+# Filter to terms appearing in at least 15 reviews
+word_counts <- tokens |>
+  group_by(word) |>
+  summarise(n_reviews = n_distinct(review_id)) |>
+  filter(n_reviews >= 15)
+
+tokens_filtered <- tokens |>
+  filter(word %in% word_counts$word)
+
+# Build co-occurrence edges (terms that co-occur in same review >= 5 times)
+co_occur <- tokens_filtered |>
+  inner_join(tokens_filtered, by = "review_id") |>
+  filter(word.x < word.y) |>  # avoid duplicates
+  group_by(word.x, word.y) |>
+  summarise(weight = n(), .groups = "drop") |>
+  filter(weight >= 5)
+
+# Build graph
+g_rag <- tidygraph::tbl_graph(
+  nodes = word_counts |> filter(word %in% c(co_occur$word.x, co_occur$word.y)),
+  edges = co_occur
+```
+
